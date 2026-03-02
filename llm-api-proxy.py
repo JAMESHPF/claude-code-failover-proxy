@@ -5,7 +5,7 @@ A lightweight, zero-dependency HTTP proxy for LLM API services
 with automatic failover, model name mapping, and configuration validation.
 """
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 import argparse
 import json
@@ -84,6 +84,9 @@ def load_env_file(env_file=None):
                             value = value.strip()
                             if not key:
                                 continue
+                            # Strip surrounding quotes ("..." or '...')
+                            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                                value = value[1:-1]
                             os.environ[key] = value
                             count += 1
                 logger.info(f"Loaded {count} env vars from {path}")
@@ -242,10 +245,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.address_string()} - {format % args}")
 
+    def do_GET(self):
+        self._handle_request(method='GET')
+
     def do_POST(self):
+        self._handle_request(method='POST')
+
+    def _handle_request(self, method='POST'):
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
+            body = None
+            if method == 'POST':
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length)
 
             config = self.server.config
             endpoints = config.get("endpoints", [])
@@ -272,7 +283,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                 try:
                     response_iter, status_code, resp_headers = self._forward_request(
-                        endpoint, api_key, body, timeout
+                        endpoint, api_key, body, timeout, method
                     )
                     is_streaming = 'text/event-stream' in resp_headers.get('Content-Type', '')
                     self._send_response(response_iter, status_code, resp_headers, is_streaming)
@@ -301,21 +312,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             logger.error(f"Request failed: {e}")
             self.send_error(500, f"Internal Server Error: {e}")
 
-    def _forward_request(self, endpoint, api_key, body, timeout):
-        try:
-            body_data = json.loads(body)
-            body_data = apply_model_mapping(endpoint, body_data)
-            body = json.dumps(body_data).encode('utf-8')
-        except json.JSONDecodeError:
-            pass
+    def _forward_request(self, endpoint, api_key, body, timeout, method='POST'):
+        if body is not None:
+            try:
+                body_data = json.loads(body)
+                body_data = apply_model_mapping(endpoint, body_data)
+                body = json.dumps(body_data).encode('utf-8')
+            except json.JSONDecodeError:
+                pass
 
         target_url = f"{endpoint['base_url']}{self.path}"
         auth_type = endpoint.get("auth_type", "anthropic")
 
         headers = {
-            'Content-Type': self.headers.get('Content-Type', 'application/json'),
             'User-Agent': f'LLM-API-Failover-Proxy/{__version__}'
         }
+
+        if body is not None:
+            headers['Content-Type'] = self.headers.get('Content-Type', 'application/json')
 
         if auth_type == "openai":
             headers['Authorization'] = f'Bearer {api_key}'
@@ -326,7 +340,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if anthropic_beta:
                 headers['anthropic-beta'] = anthropic_beta
 
-        req = Request(target_url, data=body, headers=headers, method='POST')
+        req = Request(target_url, data=body, headers=headers, method=method)
         response = urlopen(req, timeout=timeout)
 
         def response_iterator():
