@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 LLM API Failover Proxy
-轻量级 API 故障转移代理，支持多个端点自动切换
-支持配置文件、环境变量和模型名称映射
+A lightweight, zero-dependency HTTP proxy for LLM API services
+with automatic failover, model name mapping, and configuration validation.
 """
 
+__version__ = "2.2.0"
+
+import argparse
 import json
 import logging
 import sys
@@ -14,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 import socket
 
-# 配置日志
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -22,198 +25,222 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 配置文件路径
-CONFIG_FILE = os.path.expanduser("~/.llm-proxy-config.json")
+# Default config file search paths
+DEFAULT_CONFIG_PATHS = [
+    os.path.join(os.getcwd(), "config.json"),
+    os.path.expanduser("~/.llm-proxy-config.json"),
+]
 
-# 默认配置
+# Default env file search paths
+DEFAULT_ENV_PATHS = [
+    os.path.join(os.getcwd(), ".env"),
+    os.path.expanduser("~/.llm-proxy.env"),
+]
+
+# Default configuration
 DEFAULT_CONFIG = {
     "proxy": {
         "host": "127.0.0.1",
         "port": 5000,
         "timeout": 15
     },
-    "endpoints": [
-        {
-            "name": "Codesome AI",
-            "base_url": "https://cc.codesome.ai",
-            "api_key_env": "CODESOME_API_KEY"
-        },
-        {
-            "name": "SSS AI Code",
-            "base_url": "https://node-hk.sssaicode.com/api",
-            "api_key_env": "SSSAI_API_KEY"
-        }
-    ]
+    "endpoints": []
 }
 
 
+def find_config_file():
+    """Find config file from default paths."""
+    for path in DEFAULT_CONFIG_PATHS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_env_file(env_file=None):
+    """Load environment variables from .env file."""
+    if env_file:
+        paths = [env_file]
+    else:
+        paths = DEFAULT_ENV_PATHS
+
+    for path in paths:
+        if os.path.exists(path):
+            count = 0
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if '=' in line:
+                            key, _, value = line.partition('=')
+                            key = key.strip()
+                            value = value.strip()
+                            if not key:
+                                continue
+                            os.environ[key] = value
+                            count += 1
+                logger.info(f"Loaded {count} env vars from {path}")
+                return path
+            except Exception as e:
+                logger.warning(f"Failed to load env file {path}: {e}")
+                return None
+
+    return None
+
+
 def validate_config(config):
-    """验证配置文件的完整性和正确性"""
+    """Validate configuration completeness and correctness."""
     errors = []
     warnings = []
-    
-    # 检查必需的顶层字段
+
+    # Check required top-level fields
     if "proxy" not in config:
-        errors.append("缺少 'proxy' 配置节")
+        errors.append("Missing 'proxy' section")
     else:
         proxy = config["proxy"]
-        # 检查 proxy 配置的字段类型
         if "host" in proxy and not isinstance(proxy["host"], str):
-            errors.append("proxy.host 必须是字符串")
+            errors.append("proxy.host must be a string")
         if "port" in proxy and not isinstance(proxy["port"], int):
-            errors.append("proxy.port 必须是整数")
+            errors.append("proxy.port must be an integer")
         if "timeout" in proxy and not isinstance(proxy["timeout"], (int, float)):
-            errors.append("proxy.timeout 必须是数字")
-    
+            errors.append("proxy.timeout must be a number")
+
     if "endpoints" not in config:
-        errors.append("缺少 'endpoints' 配置节")
+        errors.append("Missing 'endpoints' section")
     elif not isinstance(config["endpoints"], list):
-        errors.append("'endpoints' 必须是数组")
+        errors.append("'endpoints' must be an array")
     elif len(config["endpoints"]) == 0:
-        warnings.append("'endpoints' 数组为空，代理将无法工作")
+        warnings.append("'endpoints' array is empty, proxy will not work")
     else:
-        # 检查每个端点的必需字段
         for i, endpoint in enumerate(config["endpoints"]):
-            endpoint_id = f"端点 #{i+1}"
-            
-            # 检查必需字段
+            eid = f"Endpoint #{i+1}"
+
             if "name" not in endpoint:
-                errors.append(f"{endpoint_id}: 缺少 'name' 字段")
+                errors.append(f"{eid}: missing 'name'")
             elif not isinstance(endpoint["name"], str):
-                errors.append(f"{endpoint_id}: 'name' 必须是字符串")
+                errors.append(f"{eid}: 'name' must be a string")
             else:
-                endpoint_id = f"端点 '{endpoint['name']}'"
-            
+                eid = f"Endpoint '{endpoint['name']}'"
+
             if "base_url" not in endpoint:
-                errors.append(f"{endpoint_id}: 缺少 'base_url' 字段")
+                errors.append(f"{eid}: missing 'base_url'")
             elif not isinstance(endpoint["base_url"], str):
-                errors.append(f"{endpoint_id}: 'base_url' 必须是字符串")
+                errors.append(f"{eid}: 'base_url' must be a string")
             else:
-                # 验证 URL 格式
                 url = endpoint["base_url"]
                 if not url.startswith("http://") and not url.startswith("https://"):
-                    errors.append(f"{endpoint_id}: 'base_url' 必须以 http:// 或 https:// 开头")
+                    errors.append(f"{eid}: 'base_url' must start with http:// or https://")
                 if url.endswith("/"):
-                    warnings.append(f"{endpoint_id}: 'base_url' 不应以 / 结尾（将自动处理）")
-            
-            # 检查 API Key 配置
+                    warnings.append(f"{eid}: 'base_url' should not end with /")
+
             if "api_key" not in endpoint and "api_key_env" not in endpoint:
-                errors.append(f"{endpoint_id}: 必须配置 'api_key' 或 'api_key_env' 之一")
-            
+                errors.append(f"{eid}: must have 'api_key' or 'api_key_env'")
+
             if "api_key" in endpoint and not isinstance(endpoint["api_key"], str):
-                errors.append(f"{endpoint_id}: 'api_key' 必须是字符串")
-            
+                errors.append(f"{eid}: 'api_key' must be a string")
+
             if "api_key_env" in endpoint and not isinstance(endpoint["api_key_env"], str):
-                errors.append(f"{endpoint_id}: 'api_key_env' 必须是字符串")
-            
-            # 检查 model_mapping（可选）
+                errors.append(f"{eid}: 'api_key_env' must be a string")
+
             if "model_mapping" in endpoint:
                 if not isinstance(endpoint["model_mapping"], dict):
-                    errors.append(f"{endpoint_id}: 'model_mapping' 必须是对象")
+                    errors.append(f"{eid}: 'model_mapping' must be an object")
                 else:
                     for key, value in endpoint["model_mapping"].items():
                         if not isinstance(key, str) or not isinstance(value, str):
-                            errors.append(f"{endpoint_id}: 'model_mapping' 的键和值必须都是字符串")
+                            errors.append(f"{eid}: 'model_mapping' keys and values must be strings")
                             break
-    
-    # 输出验证结果
+
     if errors:
-        logger.error("❌ 配置验证失败:")
+        logger.error("Configuration validation failed:")
         for error in errors:
             logger.error(f"  - {error}")
         if warnings:
-            logger.warning("⚠️  配置警告:")
+            logger.warning("Configuration warnings:")
             for warning in warnings:
                 logger.warning(f"  - {warning}")
-        logger.error("\n请修复配置文件后重试")
+        logger.error("\nPlease fix the configuration file and try again")
         sys.exit(1)
-    
+
     if warnings:
-        logger.warning("⚠️  配置警告:")
+        logger.warning("Configuration warnings:")
         for warning in warnings:
             logger.warning(f"  - {warning}")
-    
-    logger.info("✓ 配置验证通过")
+
+    logger.info("Configuration validation passed")
     return True
 
 
-def load_config():
-    """加载配置文件"""
-    if not os.path.exists(CONFIG_FILE):
-        logger.warning(f"配置文件不存在: {CONFIG_FILE}")
-        logger.info("使用默认配置")
+def load_config(config_file):
+    """Load configuration file."""
+    if not os.path.exists(config_file):
+        logger.warning(f"Config file not found: {config_file}")
+        logger.info("Using default configuration")
         return DEFAULT_CONFIG
 
     try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        logger.info(f"✓ 配置文件加载成功: {CONFIG_FILE}")
+        logger.info(f"Config loaded: {config_file}")
         return config
     except json.JSONDecodeError as e:
-        logger.error(f"❌ 配置文件 JSON 格式错误: {str(e)}")
-        logger.error(f"   位置: 第 {e.lineno} 行, 第 {e.colno} 列")
-        logger.error("\n提示: 可以使用以下命令验证 JSON 格式:")
-        logger.error(f"   python3 -m json.tool {CONFIG_FILE}")
+        logger.error(f"Invalid JSON in config file: {e}")
+        logger.error(f"  Location: line {e.lineno}, column {e.colno}")
+        logger.error(f"\nTip: validate with: python3 -m json.tool {config_file}")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"配置文件加载失败: {str(e)}")
-        logger.info("使用默认配置")
+        logger.error(f"Failed to load config: {e}")
+        logger.info("Using default configuration")
         return DEFAULT_CONFIG
 
 
 def resolve_api_key(endpoint):
-    """解析 API Key（支持环境变量和直接配置）"""
-    # 优先使用环境变量
+    """Resolve API key from environment variable or direct config."""
     if "api_key_env" in endpoint:
         env_var = endpoint["api_key_env"]
         api_key = os.environ.get(env_var)
         if api_key:
             return api_key
-        logger.warning(f"环境变量 {env_var} 未设置")
+        logger.warning(f"Environment variable {env_var} not set")
 
-    # 回退到直接配置的 api_key
     if "api_key" in endpoint:
         return endpoint["api_key"]
 
-    logger.error(f"端点 {endpoint.get('name', 'unknown')} 没有配置 API Key")
+    logger.error(f"No API key for endpoint: {endpoint.get('name', 'unknown')}")
     return None
 
 
 def apply_model_mapping(endpoint, body_data):
-    """应用模型名称映射"""
+    """Apply model name mapping if configured."""
     if "model_mapping" not in endpoint:
         return body_data
-    
+
     model_mapping = endpoint["model_mapping"]
     if "model" in body_data and body_data["model"] in model_mapping:
-        original_model = body_data["model"]
-        mapped_model = model_mapping[original_model]
-        body_data["model"] = mapped_model
-        logger.info(f"  模型映射: {original_model} → {mapped_model}")
-    
+        original = body_data["model"]
+        mapped = model_mapping[original]
+        body_data["model"] = mapped
+        logger.info(f"  Model mapping: {original} -> {mapped}")
+
     return body_data
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    """HTTP 代理请求处理器"""
+    """HTTP proxy request handler."""
 
     def log_message(self, format, *args):
-        """重写日志方法，使用标准 logger"""
         logger.info(f"{self.address_string()} - {format % args}")
 
     def do_POST(self):
-        """处理 POST 请求"""
         try:
-            # 读取请求体
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
 
-            # 获取配置
-            config = load_config()
+            config = load_config(self.server.config_file)
             endpoints = config.get("endpoints", [])
             timeout = config.get("proxy", {}).get("timeout", 15)
 
-            # 尝试每个 API 端点
             for endpoint in endpoints:
                 api_key = resolve_api_key(endpoint)
                 if not api_key:
@@ -223,136 +250,184 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     response_data, status_code, headers = self._forward_request(
                         endpoint, api_key, body, timeout
                     )
-
-                    # 成功，返回响应
                     self._send_response(response_data, status_code, headers)
-                    logger.info(f"✓ 请求成功: {endpoint['name']}")
+                    logger.info(f"Success: {endpoint['name']}")
                     return
 
                 except Exception as e:
-                    logger.warning(f"✗ {endpoint['name']} 失败: {str(e)}")
+                    logger.warning(f"Failed: {endpoint['name']} - {e}")
                     continue
 
-            # 所有端点都失败
             error_msg = json.dumps({
                 "error": {
-                    "message": "所有 API 端点均不可用",
+                    "message": "All API endpoints unavailable",
                     "type": "service_unavailable"
                 }
             }).encode('utf-8')
 
             self._send_response(error_msg, 503, {'Content-Type': 'application/json'})
-            logger.error("所有 API 端点均不可用")
+            logger.error("All API endpoints unavailable")
 
         except Exception as e:
-            logger.error(f"请求处理失败: {str(e)}")
-            self.send_error(500, f"Internal Server Error: {str(e)}")
+            logger.error(f"Request failed: {e}")
+            self.send_error(500, f"Internal Server Error: {e}")
 
     def _forward_request(self, endpoint, api_key, body, timeout):
-        """转发请求到指定端点"""
-        # 解析请求体并应用模型映射
         try:
             body_data = json.loads(body)
             body_data = apply_model_mapping(endpoint, body_data)
             body = json.dumps(body_data).encode('utf-8')
         except json.JSONDecodeError:
-            # 如果不是 JSON，保持原样
             pass
 
-        # 构造目标 URL
         target_url = f"{endpoint['base_url']}{self.path}"
 
-        # 构造请求头
         headers = {
             'Content-Type': self.headers.get('Content-Type', 'application/json'),
             'x-api-key': api_key,
             'anthropic-version': self.headers.get('anthropic-version', '2023-06-01'),
-            'User-Agent': 'LLM-API-Failover-Proxy/2.1'
+            'User-Agent': f'LLM-API-Failover-Proxy/{__version__}'
         }
 
-        # 创建请求
         req = Request(target_url, data=body, headers=headers, method='POST')
 
-        # 发送请求
         with urlopen(req, timeout=timeout) as response:
-            response_data = response.read()
-            status_code = response.status
-            response_headers = dict(response.headers)
-
-            return response_data, status_code, response_headers
+            return response.read(), response.status, dict(response.headers)
 
     def _send_response(self, data, status_code, headers):
-        """发送响应"""
         self.send_response(status_code)
-
-        # 设置响应头
         for key, value in headers.items():
             if key.lower() not in ['connection', 'transfer-encoding']:
                 self.send_header(key, value)
-
         self.end_headers()
         self.wfile.write(data)
 
 
-def create_default_config():
-    """创建默认配置文件"""
+def create_default_config(config_file):
+    """Create default configuration file."""
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        with open(config_file, 'w', encoding='utf-8') as f:
             json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
-        logger.info(f"✓ 默认配置文件已创建: {CONFIG_FILE}")
-        logger.info("请编辑配置文件并设置环境变量")
+        logger.info(f"Default config created: {config_file}")
+        logger.info("Please edit the config file and set up your API endpoints")
     except Exception as e:
-        logger.error(f"创建配置文件失败: {str(e)}")
+        logger.error(f"Failed to create config: {e}")
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="LLM API Failover Proxy - Lightweight API failover proxy for LLM services"
+    )
+    parser.add_argument(
+        "-c", "--config",
+        help="Path to configuration file (default: ./config.json or ~/.llm-proxy-config.json)",
+        default=None
+    )
+    parser.add_argument(
+        "-p", "--port",
+        type=int,
+        help="Override proxy port",
+        default=None
+    )
+    parser.add_argument(
+        "--host",
+        help="Override proxy host",
+        default=None
+    )
+    parser.add_argument(
+        "-e", "--env",
+        help="Path to .env file (default: ./.env or ~/.llm-proxy.env)",
+        default=None
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Create a default configuration file in current directory"
+    )
+    return parser.parse_args()
 
 
 def main():
-    """启动代理服务器"""
-    # 如果配置文件不存在，创建默认配置
-    if not os.path.exists(CONFIG_FILE):
-        create_default_config()
+    args = parse_args()
 
-    # 加载配置
-    config = load_config()
-    
-    # 验证配置
+    # Handle --init
+    if args.init:
+        config_file = os.path.join(os.getcwd(), "config.json")
+        if os.path.exists(config_file):
+            logger.error(f"Config file already exists: {config_file}")
+            sys.exit(1)
+        create_default_config(config_file)
+        env_file = os.path.join(os.getcwd(), ".env")
+        if not os.path.exists(env_file):
+            with open(env_file, 'w') as f:
+                f.write("# Add your API keys here\n# EXAMPLE_API_KEY=sk-your-key-here\n")
+            os.chmod(env_file, 0o600)
+            logger.info(f"Environment file created: {env_file}")
+        logger.info("\nNext steps:")
+        logger.info("  1. Edit config.json and add your API endpoints")
+        logger.info("  2. Edit .env and add your API keys")
+        logger.info("  3. Run: python3 llm-api-proxy.py")
+        return
+
+    # Find config file
+    if args.config:
+        config_file = args.config
+    else:
+        config_file = find_config_file()
+        if not config_file:
+            config_file = DEFAULT_CONFIG_PATHS[0]
+
+    # Load env file (before config validation, so API keys are available)
+    load_env_file(args.env)
+
+    # Load and validate config
+    config = load_config(config_file)
     validate_config(config)
-    
-    proxy_config = config.get("proxy", {})
-    host = proxy_config.get("host", "127.0.0.1")
-    port = proxy_config.get("port", 5000)
 
-    server_address = (host, port)
+    # Apply CLI overrides
+    proxy_config = config.get("proxy", {})
+    host = args.host or proxy_config.get("host", "127.0.0.1")
+    port = args.port or proxy_config.get("port", 5000)
 
     try:
-        httpd = HTTPServer(server_address, ProxyHandler)
-        logger.info(f"🚀 代理服务器启动: http://{host}:{port}")
-        logger.info(f"📋 配置了 {len(config.get('endpoints', []))} 个 API 端点")
+        httpd = HTTPServer((host, port), ProxyHandler)
+        httpd.config_file = config_file
+
+        logger.info(f"LLM API Failover Proxy v{__version__}")
+        logger.info(f"Listening on http://{host}:{port}")
+        logger.info(f"Endpoints: {len(config.get('endpoints', []))}")
 
         for i, endpoint in enumerate(config.get('endpoints', []), 1):
             api_key = resolve_api_key(endpoint)
-            status = "✓" if api_key else "✗"
-            model_mapping_info = ""
+            status = "OK" if api_key else "NO KEY"
+            mapping = ""
             if "model_mapping" in endpoint:
-                mappings = endpoint["model_mapping"]
-                model_mapping_info = f" (模型映射: {len(mappings)} 个)"
-            logger.info(f"  {i}. {status} {endpoint['name']} - {endpoint['base_url']}{model_mapping_info}")
+                mapping = f" (model mapping: {len(endpoint['model_mapping'])})"
+            logger.info(f"  {i}. [{status}] {endpoint['name']} - {endpoint['base_url']}{mapping}")
 
+        logger.info("Ready to accept requests")
         httpd.serve_forever()
 
     except KeyboardInterrupt:
-        logger.info("\n⏹️  收到停止信号，关闭服务器...")
+        logger.info("\nShutting down...")
         httpd.shutdown()
         sys.exit(0)
 
     except socket.error as e:
-        if e.errno == 48:  # Address already in use
-            logger.error(f"❌ 端口 {port} 已被占用")
+        if e.errno in (48, 98):  # Address already in use (macOS: 48, Linux: 98)
+            logger.error(f"Port {port} is already in use")
         else:
-            logger.error(f"❌ Socket 错误: {str(e)}")
+            logger.error(f"Socket error: {e}")
         sys.exit(1)
 
     except Exception as e:
-        logger.error(f"❌ 启动失败: {str(e)}")
+        logger.error(f"Failed to start: {e}")
         sys.exit(1)
 
 

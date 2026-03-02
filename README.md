@@ -58,6 +58,7 @@ A lightweight, zero-dependency HTTP proxy for LLM API services with automatic fa
    ```bash
    python3 llm-api-proxy.py
    ```
+   The proxy automatically loads `.env` from the current directory or `~/.llm-proxy.env`.
 
 5. **Install as systemd service** (optional)
    ```bash
@@ -68,6 +69,20 @@ A lightweight, zero-dependency HTTP proxy for LLM API services with automatic fa
    sudo systemctl enable llm-api-proxy
    sudo systemctl start llm-api-proxy
    ```
+
+### CLI Options
+
+```
+usage: llm-api-proxy.py [-h] [-c CONFIG] [-p PORT] [--host HOST] [-e ENV] [-v] [--init]
+
+options:
+  -c, --config CONFIG   Path to configuration file
+  -p, --port PORT       Override proxy port
+  --host HOST           Override proxy host
+  -e, --env ENV         Path to .env file
+  -v, --version         Show version
+  --init                Create default config in current directory
+```
 
 ### Configuration
 
@@ -243,6 +258,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
    ```bash
    python3 llm-api-proxy.py
    ```
+   代理会自动从当前目录的 `.env` 或 `~/.llm-proxy.env` 加载环境变量。
 
 5. **安装为 systemd 服务**（可选）
    ```bash
@@ -253,6 +269,20 @@ Contributions are welcome! Please feel free to submit a Pull Request.
    sudo systemctl enable llm-api-proxy
    sudo systemctl start llm-api-proxy
    ```
+
+### 命令行选项
+
+```
+用法: llm-api-proxy.py [-h] [-c CONFIG] [-p PORT] [--host HOST] [-e ENV] [-v] [--init]
+
+选项:
+  -c, --config CONFIG   配置文件路径
+  -p, --port PORT       覆盖代理端口
+  --host HOST           覆盖代理主机
+  -e, --env ENV         .env 文件路径
+  -v, --version         显示版本
+  --init                在当前目录创建默认配置
+```
 
 ### 配置说明
 
