@@ -5,13 +5,16 @@ A lightweight, zero-dependency HTTP proxy for LLM API services
 with automatic failover, model name mapping, and configuration validation.
 """
 
-__version__ = "2.6.0"
+__version__ = "3.0.0"
 
 import argparse
 import json
 import logging
+import signal
 import sys
 import os
+import threading
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -26,13 +29,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Thread lock for shared state
+_lock = threading.Lock()
+
 # Circuit breaker state: {endpoint_name: {"failures": int, "last_failure": float}}
 _circuit_breaker = {}
+
+# Request statistics
+_stats = {
+    "start_time": time.time(),
+    "total_requests": 0,
+    "endpoints": {}  # name -> {"success": 0, "fail_5xx": 0, "fail_4xx": 0, "fail_conn": 0, "last_success": None, "last_failure": None}
+}
 
 VALID_AUTH_TYPES = ("anthropic", "openai")
 
 # HTTP status codes that should retry the next endpoint without tripping circuit breaker
 RETRYABLE_CLIENT_ERRORS = (401, 403, 429)
+
+# Environment variable overrides for proxy config
+ENV_OVERRIDES = {
+    "PROXY_TIMEOUT": ("timeout", int),
+    "PROXY_CB_THRESHOLD": ("circuit_breaker_threshold", int),
+    "PROXY_CB_COOLDOWN": ("circuit_breaker_cooldown", int),
+    "PROXY_MAX_BODY_SIZE": ("max_body_size", int),
+}
 
 # Default config file search paths
 DEFAULT_CONFIG_PATHS = [
@@ -101,12 +122,11 @@ def load_env_file(env_file=None):
     return None
 
 
-def validate_config(config):
-    """Validate configuration completeness and correctness."""
+def _check_config(config):
+    """Validate configuration, return (errors, warnings) lists."""
     errors = []
     warnings = []
 
-    # Check required top-level fields
     if "proxy" not in config:
         errors.append("Missing 'proxy' section")
     else:
@@ -159,6 +179,9 @@ def validate_config(config):
                 if endpoint["auth_type"] not in VALID_AUTH_TYPES:
                     errors.append(f"{eid}: 'auth_type' must be one of {VALID_AUTH_TYPES}")
 
+            if "timeout" in endpoint and not isinstance(endpoint["timeout"], (int, float)):
+                errors.append(f"{eid}: 'timeout' must be a number")
+
             if "model_mapping" in endpoint:
                 if not isinstance(endpoint["model_mapping"], dict):
                     errors.append(f"{eid}: 'model_mapping' must be an object")
@@ -167,6 +190,13 @@ def validate_config(config):
                         if not isinstance(key, str) or not isinstance(value, str):
                             errors.append(f"{eid}: 'model_mapping' keys and values must be strings")
                             break
+
+    return errors, warnings
+
+
+def validate_config(config):
+    """Validate configuration, exit on errors. Used at startup."""
+    errors, warnings = _check_config(config)
 
     if errors:
         logger.error("Configuration validation failed:")
@@ -244,11 +274,40 @@ def apply_model_mapping(endpoint, body_data):
 
 def _cb_record_failure(name, threshold):
     """Record a circuit breaker failure for the named endpoint."""
-    state = _circuit_breaker.setdefault(name, {"failures": 0, "last_failure": 0})
-    state["failures"] += 1
-    state["last_failure"] = time.time()
+    with _lock:
+        state = _circuit_breaker.setdefault(name, {"failures": 0, "last_failure": 0})
+        state["failures"] += 1
+        state["last_failure"] = time.time()
     logger.warning(f"  Circuit breaker: {name} failures={state['failures']}/{threshold}")
     return state
+
+
+def _stats_record(name, event):
+    """Record an event in request statistics."""
+    with _lock:
+        ep = _stats["endpoints"].setdefault(name, {
+            "success": 0, "fail_5xx": 0, "fail_4xx": 0, "fail_conn": 0,
+            "last_success": None, "last_failure": None
+        })
+        if event == "success":
+            ep["success"] += 1
+            ep["last_success"] = time.time()
+        elif event == "fail_5xx":
+            ep["fail_5xx"] += 1
+            ep["last_failure"] = time.time()
+        elif event == "fail_4xx":
+            ep["fail_4xx"] += 1
+            ep["last_failure"] = time.time()
+        elif event == "fail_conn":
+            ep["fail_conn"] += 1
+            ep["last_failure"] = time.time()
+
+
+def _format_ts(ts):
+    """Format a timestamp as ISO 8601 string, or None."""
+    if ts is None:
+        return None
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(ts))
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -257,18 +316,110 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.address_string()} - {format % args}")
 
+    def log_error(self, format, *args):
+        logger.warning(f"{self.address_string()} - {format % args}")
+
     def do_GET(self):
         self._handle_request(method='GET')
 
     def do_POST(self):
         self._handle_request(method='POST')
 
+    def _handle_health(self):
+        """Handle /_proxy/health endpoint."""
+        resp = json.dumps({
+            "status": "ok",
+            "version": __version__,
+            "uptime_seconds": round(time.time() - _stats["start_time"])
+        }).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(resp))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def _handle_status(self):
+        """Handle /_proxy/status endpoint."""
+        config = self.server.config
+        proxy_config = config.get("proxy", {})
+        cb_threshold = proxy_config.get("circuit_breaker_threshold", 3)
+        cb_cooldown = proxy_config.get("circuit_breaker_cooldown", 60)
+
+        endpoints_status = []
+        with _lock:
+            for endpoint in config.get("endpoints", []):
+                name = endpoint.get("name", "unknown")
+                cb = _circuit_breaker.get(name, {"failures": 0, "last_failure": 0})
+                ep_stats = _stats["endpoints"].get(name, {
+                    "success": 0, "fail_5xx": 0, "fail_4xx": 0, "fail_conn": 0,
+                    "last_success": None, "last_failure": None
+                })
+
+                # Determine circuit state
+                if cb["failures"] >= cb_threshold:
+                    elapsed = time.time() - cb["last_failure"]
+                    if elapsed < cb_cooldown:
+                        state = "open"
+                        retry_in = round(cb_cooldown - elapsed)
+                    else:
+                        state = "half-open"
+                        retry_in = 0
+                else:
+                    state = "closed"
+                    retry_in = 0
+
+                entry = {
+                    "name": name,
+                    "circuit_state": state,
+                    "failures": cb["failures"],
+                    "stats": {
+                        "success": ep_stats.get("success", 0),
+                        "fail_5xx": ep_stats.get("fail_5xx", 0),
+                        "fail_4xx": ep_stats.get("fail_4xx", 0),
+                        "fail_conn": ep_stats.get("fail_conn", 0),
+                    },
+                    "last_success": _format_ts(ep_stats.get("last_success")),
+                    "last_failure": _format_ts(ep_stats.get("last_failure")),
+                }
+                if retry_in > 0:
+                    entry["retry_in_seconds"] = retry_in
+                endpoints_status.append(entry)
+
+            total_requests = _stats["total_requests"]
+
+        resp = json.dumps({
+            "version": __version__,
+            "uptime_seconds": round(time.time() - _stats["start_time"]),
+            "total_requests": total_requests,
+            "endpoints": endpoints_status
+        }, indent=2).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(resp))
+        self.end_headers()
+        self.wfile.write(resp)
+
     def _handle_request(self, method='POST'):
+        # Intercept proxy management endpoints
+        if self.path == '/_proxy/health':
+            self._handle_health()
+            return
+        if self.path == '/_proxy/status':
+            self._handle_status()
+            return
+
+        t0 = time.time()
+        rid = uuid.uuid4().hex[:8]
+        attempts = []
+
+        with _lock:
+            _stats["total_requests"] += 1
+
         try:
             config = self.server.config
             endpoints = config.get("endpoints", [])
             proxy_config = config.get("proxy", {})
-            timeout = proxy_config.get("timeout", 15)
+            global_timeout = proxy_config.get("timeout", 15)
 
             body = None
             if method == 'POST':
@@ -287,26 +438,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 name = endpoint.get("name", "unknown")
 
                 # Circuit breaker check
-                cb_state = _circuit_breaker.get(name)
-                if cb_state and cb_state["failures"] >= cb_threshold:
-                    elapsed = time.time() - cb_state["last_failure"]
-                    if elapsed < cb_cooldown:
-                        logger.debug(f"Circuit breaker open: {name} (retry in {cb_cooldown - elapsed:.0f}s)")
-                        continue
-                    logger.info(f"Circuit breaker half-open: retrying {name}")
+                with _lock:
+                    cb_state = _circuit_breaker.get(name)
+                    if cb_state and cb_state["failures"] >= cb_threshold:
+                        elapsed = time.time() - cb_state["last_failure"]
+                        if elapsed < cb_cooldown:
+                            logger.debug(f"[{rid}] Circuit breaker open: {name} (retry in {cb_cooldown - elapsed:.0f}s)")
+                            attempts.append({"name": name, "result": "skipped", "detail": f"circuit breaker open (retry in {cb_cooldown - elapsed:.0f}s)"})
+                            continue
+                        logger.info(f"[{rid}] Circuit breaker half-open: retrying {name}")
 
                 api_key = resolve_api_key(endpoint)
                 if not api_key:
+                    attempts.append({"name": name, "result": "skipped", "detail": "no API key"})
                     continue
+
+                ep_timeout = endpoint.get("timeout", global_timeout)
 
                 try:
                     response_iter, status_code, resp_headers = self._forward_request(
-                        endpoint, api_key, body, timeout, method
+                        endpoint, api_key, body, ep_timeout, method
                     )
                     is_streaming = 'text/event-stream' in resp_headers.get('Content-Type', '')
                     self._send_response(response_iter, status_code, resp_headers, is_streaming)
-                    _circuit_breaker.pop(name, None)
-                    logger.info(f"Success: {name}{' (streaming)' if is_streaming else ''}")
+                    with _lock:
+                        cb = _circuit_breaker.get(name)
+                        if cb:
+                            cb["failures"] = 0
+                    _stats_record(name, "success")
+                    elapsed = time.time() - t0
+                    logger.info(f"[{rid}] {method} {self.path} -> {name} | {status_code} | {elapsed:.2f}s{' | streaming' if is_streaming else ''} | attempts={len(attempts)+1}")
                     return
 
                 except HTTPError as e:
@@ -315,37 +476,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     e.close()
 
                     if e.code >= 500:
-                        # Server error: trip circuit breaker, try next endpoint
                         _cb_record_failure(name, cb_threshold)
+                        _stats_record(name, "fail_5xx")
                         last_error = (error_body, e.code, error_headers)
-                        logger.warning(f"Server error: {name} - HTTP {e.code}")
+                        attempts.append({"name": name, "result": "fail", "detail": f"HTTP {e.code}"})
+                        logger.warning(f"[{rid}] Server error: {name} - HTTP {e.code}")
                         continue
 
                     elif e.code in RETRYABLE_CLIENT_ERRORS:
-                        # 401/403: auth issue (next endpoint has different key)
-                        # 429: rate limited (next endpoint may have quota)
-                        # Don't trip circuit breaker
+                        _stats_record(name, "fail_4xx")
                         last_error = (error_body, e.code, error_headers)
-                        logger.warning(f"Retryable error: {name} - HTTP {e.code}")
+                        attempts.append({"name": name, "result": "fail", "detail": f"HTTP {e.code}"})
+                        logger.warning(f"[{rid}] Retryable error: {name} - HTTP {e.code}")
                         continue
 
                     else:
-                        # 400/404/422 etc: client error, forward to client immediately
+                        _stats_record(name, "fail_4xx")
                         self._send_response(error_body, e.code, error_headers)
-                        logger.warning(f"Client error via {name}: HTTP {e.code}")
+                        elapsed = time.time() - t0
+                        logger.warning(f"[{rid}] {method} {self.path} -> {name} | {e.code} | {elapsed:.2f}s | client error")
                         return
 
                 except (URLError, OSError) as e:
-                    # Connection failure: trip circuit breaker, try next endpoint
                     _cb_record_failure(name, cb_threshold)
-                    logger.warning(f"Connection failed: {name} - {e}")
+                    _stats_record(name, "fail_conn")
+                    err_detail = str(e.reason) if hasattr(e, 'reason') else str(e)
+                    attempts.append({"name": name, "result": "fail", "detail": err_detail})
+                    logger.warning(f"[{rid}] Connection failed: {name} - {err_detail}")
                     continue
 
-            # All endpoints exhausted
+            # All endpoints exhausted — detailed failure log
+            elapsed = time.time() - t0
+            summary_lines = [f"[{rid}] All endpoints exhausted ({len(attempts)} attempted) in {elapsed:.2f}s:"]
+            for i, a in enumerate(attempts, 1):
+                summary_lines.append(f"  {i}. {a['name']}: {a['result']} - {a['detail']}")
+            logger.error("\n".join(summary_lines))
+
             if last_error:
                 err_body, err_code, err_headers = last_error
                 self._send_response(err_body, err_code, err_headers)
-                logger.error(f"All endpoints failed, returning last error: HTTP {err_code}")
             else:
                 error_msg = json.dumps({
                     "error": {
@@ -354,10 +523,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                 }).encode('utf-8')
                 self._send_response(error_msg, 503, {'Content-Type': 'application/json'})
-                logger.error("All API endpoints unavailable")
 
         except Exception as e:
-            logger.error(f"Request failed: {e}")
+            logger.error(f"[{rid}] Request failed: {e}")
             self.send_error(500, f"Internal Server Error: {e}")
 
     def _forward_request(self, endpoint, api_key, body, timeout, method='POST'):
@@ -439,6 +607,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
 
 
+class ThreadingHTTPServer(HTTPServer):
+    """HTTPServer with threading support for concurrent requests."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+    def process_request(self, request, client_address):
+        t = threading.Thread(target=self.process_request_thread, args=(request, client_address))
+        t.daemon = self.daemon_threads
+        t.start()
+
+
 def create_default_config(config_file):
     """Create default configuration file."""
     try:
@@ -477,6 +664,12 @@ def parse_args():
         default=None
     )
     parser.add_argument(
+        "--log-level",
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help="Set logging level",
+        default=None
+    )
+    parser.add_argument(
         "-v", "--version",
         action="version",
         version=f"%(prog)s {__version__}"
@@ -486,11 +679,34 @@ def parse_args():
         action="store_true",
         help="Create a default configuration file in current directory"
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate configuration file and exit"
+    )
     return parser.parse_args()
+
+
+def _apply_env_overrides(proxy_config):
+    """Apply PROXY_* environment variable overrides to proxy config."""
+    for env_key, (config_key, cast) in ENV_OVERRIDES.items():
+        val = os.environ.get(env_key)
+        if val is not None:
+            try:
+                proxy_config[config_key] = cast(val)
+                logger.info(f"  Config override: {config_key}={proxy_config[config_key]} (from {env_key})")
+            except ValueError:
+                logger.warning(f"  Invalid {env_key}={val}, ignoring")
 
 
 def main():
     args = parse_args()
+
+    # Apply log level from CLI or env var
+    log_level = args.log_level or os.environ.get('PROXY_LOG_LEVEL')
+    if log_level:
+        logging.getLogger().setLevel(getattr(logging, log_level.upper(), logging.INFO))
+        logger.info(f"Log level: {log_level.upper()}")
 
     # Handle --init
     if args.init:
@@ -508,7 +724,8 @@ def main():
         logger.info("\nNext steps:")
         logger.info("  1. Edit config.json and add your API endpoints")
         logger.info("  2. Edit .env and add your API keys")
-        logger.info("  3. Run: python3 llm-api-proxy.py")
+        logger.info("  3. Validate: python3 llm-api-proxy.py --validate")
+        logger.info("  4. Run: python3 llm-api-proxy.py")
         return
 
     # Find config file
@@ -524,6 +741,25 @@ def main():
 
     # Load and validate config
     config = load_config(config_file)
+
+    # Handle --validate
+    if args.validate:
+        errors, warnings = _check_config(config)
+        if errors:
+            logger.error("Configuration validation failed:")
+            for error in errors:
+                logger.error(f"  - {error}")
+        if warnings:
+            logger.warning("Configuration warnings:")
+            for warning in warnings:
+                logger.warning(f"  - {warning}")
+        if not errors:
+            # Check API key availability
+            endpoints = config.get("endpoints", [])
+            keys_ok = sum(1 for ep in endpoints if resolve_api_key(ep))
+            logger.info(f"Config OK: {len(endpoints)} endpoints, {keys_ok} with valid keys")
+        sys.exit(1 if errors else 0)
+
     validate_config(config)
 
     # Apply CLI overrides
@@ -531,24 +767,57 @@ def main():
     host = args.host if args.host is not None else proxy_config.get("host", "127.0.0.1")
     port = args.port if args.port is not None else proxy_config.get("port", 5000)
 
+    # Apply env var overrides
+    _apply_env_overrides(proxy_config)
+
     try:
-        httpd = HTTPServer((host, port), ProxyHandler)
+        httpd = ThreadingHTTPServer((host, port), ProxyHandler)
         httpd.config_file = config_file
         httpd.config = config
 
         cb_threshold = proxy_config.get("circuit_breaker_threshold", 3)
         cb_cooldown = proxy_config.get("circuit_breaker_cooldown", 60)
 
-        logger.info(f"LLM API Failover Proxy v{__version__}")
+        # Signal handlers
+        def _reload_handler(signum, frame):
+            try:
+                new_cfg = load_config(httpd.config_file)
+                errors, warnings = _check_config(new_cfg)
+                if errors:
+                    logger.error(f"Config reload failed ({len(errors)} errors):")
+                    for e in errors:
+                        logger.error(f"  - {e}")
+                    return
+                httpd.config = new_cfg
+                for w in warnings:
+                    logger.warning(f"  Config warning: {w}")
+                logger.info("Config reloaded via SIGHUP")
+            except Exception as e:
+                logger.error(f"Config reload failed: {e}")
+
+        def _shutdown_handler(signum, frame):
+            logger.info("SIGTERM received, shutting down gracefully...")
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+        if hasattr(signal, 'SIGHUP'):
+            signal.signal(signal.SIGHUP, _reload_handler)
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+
+        logger.info(f"Claude Code Failover Proxy v{__version__}")
         logger.info(f"Listening on http://{host}:{port}")
         logger.info(f"Endpoints: {len(config.get('endpoints', []))}")
+        logger.info(f"Threading: enabled")
         logger.info(f"Circuit breaker: {cb_threshold} failures / {cb_cooldown}s cooldown")
+        logger.info(f"Management: http://{host}:{port}/_proxy/health | /_proxy/status")
+        if hasattr(signal, 'SIGHUP'):
+            logger.info(f"Hot reload: kill -HUP {os.getpid()}")
 
         for i, endpoint in enumerate(config.get('endpoints', []), 1):
             api_key = resolve_api_key(endpoint)
             status = "OK" if api_key else "NO KEY"
             auth_type = endpoint.get("auth_type", "anthropic")
-            extras = f" [{auth_type}]"
+            ep_timeout = endpoint.get("timeout", proxy_config.get("timeout", 15))
+            extras = f" [{auth_type}] timeout={ep_timeout}s"
             if "model_mapping" in endpoint:
                 extras += f" (model mapping: {len(endpoint['model_mapping'])})"
             logger.info(f"  {i}. [{status}] {endpoint['name']} - {endpoint['base_url']}{extras}")

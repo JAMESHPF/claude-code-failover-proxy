@@ -14,6 +14,8 @@ EnvironmentFile=/home/llmproxy/.llm-proxy.env
 ExecStart=/usr/bin/python3 /home/llmproxy/llm-api-proxy.py -c /home/llmproxy/.llm-proxy-config.json
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
+ExecReload=/bin/kill -HUP $MAINPID
 StandardOutput=journal
 StandardError=journal
 

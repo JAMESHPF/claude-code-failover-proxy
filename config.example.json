@@ -4,18 +4,21 @@
     "port": 5000,
     "timeout": 15,
     "circuit_breaker_threshold": 3,
-    "circuit_breaker_cooldown": 60
+    "circuit_breaker_cooldown": 60,
+    "max_body_size": 52428800
   },
   "endpoints": [
     {
       "name": "Primary API",
       "base_url": "https://api.example.com",
-      "api_key_env": "PRIMARY_API_KEY"
+      "api_key_env": "PRIMARY_API_KEY",
+      "timeout": 10
     },
     {
-      "name": "Backup API",
+      "name": "Backup API (slower)",
       "base_url": "https://backup-api.example.com",
-      "api_key_env": "BACKUP_API_KEY"
+      "api_key_env": "BACKUP_API_KEY",
+      "timeout": 30
     },
     {
       "name": "API with Model Mapping",

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-03-03
+
+### Added
+- **Concurrent request handling** with `ThreadingHTTPServer` (no more blocking on streaming)
+- **`/_proxy/health`** endpoint returning status, version, uptime
+- **`/_proxy/status`** endpoint with per-endpoint stats, circuit breaker states, request counts
+- **Request ID** (`[a1b2c3d4]`) in all log lines for request tracing
+- **Request latency** and endpoint name in success/failure logs
+- **Detailed failure summary** when all endpoints are exhausted, listing each attempt
+- **`--log-level`** CLI parameter and `PROXY_LOG_LEVEL` env var
+- **`--validate`** mode to check config without starting the server
+- **Per-endpoint `timeout`** configuration (overrides global timeout)
+- **Environment variable overrides**: `PROXY_TIMEOUT`, `PROXY_CB_THRESHOLD`, `PROXY_CB_COOLDOWN`, `PROXY_MAX_BODY_SIZE`
+- **SIGHUP hot reload** for config changes without restart
+- **SIGTERM graceful shutdown** waits for in-flight requests
+- **Request statistics** tracking per endpoint (success, fail_5xx, fail_4xx, fail_conn)
+- Thread-safe shared state with `threading.Lock`
+- `log_error` override to route all logs through logging framework
+
+### Changed
+- Server class changed from `HTTPServer` to `ThreadingHTTPServer`
+- Circuit breaker now resets `failures=0` on success instead of removing the entry (preserves stats)
+- Startup log now shows per-endpoint timeout, threading status, and management URLs
+
 ## [2.6.0] - 2026-03-02
 
 ### Fixed
