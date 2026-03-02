@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-03-02
+
+### Added
+- GET method support for proxying requests like `/v1/models`
+- `.env` file quote handling: `KEY="value"` and `KEY='value'` are automatically unquoted
+
+## [2.4.0] - 2026-03-02
+
+### Added
+- `auth_type` endpoint configuration supporting `"anthropic"` (default) and `"openai"` authentication
+- OpenAI-compatible authentication with `Authorization: Bearer` header
+- `anthropic-beta` header forwarding for Anthropic endpoints
+- Circuit breaker pattern to skip failing endpoints after consecutive failures
+- `circuit_breaker_threshold` proxy configuration (default: 3)
+- `circuit_breaker_cooldown` proxy configuration (default: 60 seconds)
+- Failure count logging per endpoint (e.g., `failures: 1/3`)
+
+## [2.3.0] - 2026-03-02
+
+### Added
+- Streaming response support with chunked transfer encoding (SSE/text-event-stream)
+- Real-time LLM output forwarding via `_write_streaming()` method
+
+### Changed
+- Configuration loaded once at startup instead of per-request (performance optimization)
+- `_forward_request()` returns response iterator instead of buffered bytes
+- `_send_response()` supports both streaming and non-streaming modes
+
 ## [2.2.0] - 2026-03-02
 
 ### Added

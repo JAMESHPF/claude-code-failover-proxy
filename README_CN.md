@@ -13,6 +13,10 @@
 - **环境变量支持**：通过环境变量安全管理 API 密钥
 - **Systemd 集成**：作为系统服务运行，支持自动重启
 - **详细日志**：清晰的日志便于调试和监控
+- **流式响应**：支持 SSE 流式传输，使用 chunked 编码实时输出 LLM 响应
+- **断路器保护**：连续失败后自动跳过故障端点，支持配置阈值和冷却时间
+- **多协议认证**：同时支持 Anthropic（`x-api-key`）和 OpenAI（`Authorization: Bearer`）认证方式
+- **GET/POST 支持**：代理 GET（如 `/v1/models`）和 POST 请求
 
 ## 使用场景
 
@@ -89,7 +93,9 @@
   "proxy": {
     "host": "127.0.0.1",
     "port": 5000,
-    "timeout": 15
+    "timeout": 15,
+    "circuit_breaker_threshold": 3,
+    "circuit_breaker_cooldown": 60
   },
   "endpoints": [
     {
@@ -104,6 +110,12 @@
       "model_mapping": {
         "claude-opus-4-6": "claude-opus-4-6-thinking"
       }
+    },
+    {
+      "name": "OpenAI 兼容 API",
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY",
+      "auth_type": "openai"
     }
   ]
 }
@@ -114,7 +126,10 @@
 ```bash
 PRIMARY_API_KEY=sk-your-primary-key
 BACKUP_API_KEY=sk-your-backup-key
+OPENAI_API_KEY=sk-your-openai-key
 ```
+
+支持带引号的值：`KEY="value"` 和 `KEY='value'` 会自动去除引号。
 
 ## 模型名称映射
 
@@ -133,6 +148,43 @@ BACKUP_API_KEY=sk-your-backup-key
 ```
 
 当客户端请求 `claude-opus-4-6` 时，代理会自动向该端点发送 `claude-opus-4-6-thinking`。
+
+### 认证方式
+
+代理通过 endpoint 的 `auth_type` 字段支持不同认证方式：
+
+| `auth_type` | 发送的请求头 | 默认 |
+|-------------|-------------|------|
+| `"anthropic"` | `x-api-key` + `anthropic-version` | 是 |
+| `"openai"` | `Authorization: Bearer <key>` | 否 |
+
+```json
+{
+  "name": "OpenAI 兼容 API",
+  "base_url": "https://api.openai.com",
+  "api_key_env": "OPENAI_API_KEY",
+  "auth_type": "openai"
+}
+```
+
+### 断路器
+
+代理内置断路器机制，避免反复请求故障端点：
+
+- 连续失败 `circuit_breaker_threshold` 次后（默认 3），自动跳过该端点
+- 冷却 `circuit_breaker_cooldown` 秒后（默认 60），重新尝试
+- 请求成功后，失败计数归零
+
+在 `proxy` 配置中设置：
+
+```json
+{
+  "proxy": {
+    "circuit_breaker_threshold": 3,
+    "circuit_breaker_cooldown": 60
+  }
+}
+```
 
 ## 与 Claude Code 配合使用
 
@@ -157,6 +209,11 @@ curl -X POST http://127.0.0.1:5000/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"claude-opus-4-6","max_tokens":20,"messages":[{"role":"user","content":"test"}]}'
+```
+
+```bash
+# 测试 GET 请求（如列出模型）
+curl http://127.0.0.1:5000/v1/models
 ```
 
 查看日志：

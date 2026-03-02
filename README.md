@@ -13,6 +13,10 @@ A lightweight, zero-dependency HTTP proxy for LLM API services with automatic fa
 - **Environment Variable Support**: Securely manages API keys via environment variables
 - **Systemd Integration**: Runs as a system service with auto-restart
 - **Detailed Logging**: Clear logs for debugging and monitoring
+- **Streaming Support**: Supports SSE streaming responses with chunked transfer encoding for real-time LLM output
+- **Circuit Breaker**: Automatically skips failing endpoints after consecutive failures, with configurable threshold and cooldown
+- **Multi-Protocol Auth**: Supports both Anthropic (`x-api-key`) and OpenAI (`Authorization: Bearer`) authentication styles
+- **GET & POST Support**: Proxies both GET (e.g., `/v1/models`) and POST requests
 
 ## Use Cases
 
@@ -89,7 +93,9 @@ options:
   "proxy": {
     "host": "127.0.0.1",
     "port": 5000,
-    "timeout": 15
+    "timeout": 15,
+    "circuit_breaker_threshold": 3,
+    "circuit_breaker_cooldown": 60
   },
   "endpoints": [
     {
@@ -104,6 +110,12 @@ options:
       "model_mapping": {
         "claude-opus-4-6": "claude-opus-4-6-thinking"
       }
+    },
+    {
+      "name": "OpenAI Compatible",
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY",
+      "auth_type": "openai"
     }
   ]
 }
@@ -114,7 +126,10 @@ options:
 ```bash
 PRIMARY_API_KEY=sk-your-primary-key
 BACKUP_API_KEY=sk-your-backup-key
+OPENAI_API_KEY=sk-your-openai-key
 ```
+
+Quoted values are supported: `KEY="value"` and `KEY='value'` are automatically unquoted.
 
 ## Model Name Mapping
 
@@ -133,6 +148,43 @@ Some API providers use different model naming conventions. The proxy can automat
 ```
 
 When your client requests `claude-opus-4-6`, the proxy automatically sends `claude-opus-4-6-thinking` to this endpoint.
+
+### Authentication Types
+
+The proxy supports different authentication styles via the `auth_type` endpoint field:
+
+| `auth_type` | Header Sent | Default |
+|-------------|-------------|---------|
+| `"anthropic"` | `x-api-key` + `anthropic-version` | Yes |
+| `"openai"` | `Authorization: Bearer <key>` | No |
+
+```json
+{
+  "name": "OpenAI Compatible",
+  "base_url": "https://api.openai.com",
+  "api_key_env": "OPENAI_API_KEY",
+  "auth_type": "openai"
+}
+```
+
+### Circuit Breaker
+
+The proxy includes a circuit breaker to avoid repeatedly hitting failing endpoints:
+
+- After `circuit_breaker_threshold` consecutive failures (default: 3), the endpoint is temporarily skipped
+- After `circuit_breaker_cooldown` seconds (default: 60), the endpoint is retried
+- On success, the failure count is reset
+
+Configure in the `proxy` section:
+
+```json
+{
+  "proxy": {
+    "circuit_breaker_threshold": 3,
+    "circuit_breaker_cooldown": 60
+  }
+}
+```
 
 ## Using with Claude Code
 
@@ -157,6 +209,11 @@ curl -X POST http://127.0.0.1:5000/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"claude-opus-4-6","max_tokens":20,"messages":[{"role":"user","content":"test"}]}'
+```
+
+```bash
+# Test GET (e.g., list models)
+curl http://127.0.0.1:5000/v1/models
 ```
 
 Check logs:
